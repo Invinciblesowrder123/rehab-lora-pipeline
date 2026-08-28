@@ -161,8 +161,44 @@ def _parse_aixw_output(result):
                 return c.get("text", "")
     return None
 
+def _read_aixw_stream(resp):
+    """解析 Responses API 的 SSE 流式响应, 拼接 output_text 增量; 返回 (text, usage|None)。
+    流式调用规避官方对非流式请求的限流。"""
+    buf, usage = [], None
+    for raw_line in resp:
+        line = raw_line.decode('utf-8', 'replace').strip()
+        if not line or line.startswith(':'):
+            continue  # 空行 / SSE 心跳注释
+        if not line.startswith('data:'):
+            continue
+        data = line[len('data:'):].strip()
+        if data == '[DONE]':
+            break
+        try:
+            evt = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        t = evt.get('type')
+        # 文本增量(主路径): response.output_text.delta 事件的 delta 字段
+        delta = evt.get('delta')
+        if delta:
+            buf.append(delta)
+        # 部分实现在 response.output_text 事件中给累计/全文 text(仅当无 delta 时采用, 防重复)
+        elif t == 'response.output_text' and evt.get('text'):
+            buf.append(evt['text'])
+        # 用量: 出现在 response.completed / response.usage.updated 事件
+        if evt.get('usage'):
+            usage = evt['usage']
+        # 错误 / 失败事件
+        if t == 'error' or evt.get('error'):
+            raise RuntimeError(f"aixw 流式错误: {evt.get('error') or evt}")
+        if t == 'response.failed':
+            raise RuntimeError(f"aixw 流式失败: {evt.get('status')}")
+    return ''.join(buf), usage
+
+
 def _call_aixw(messages, cp, temperature, max_tokens):
-    """主路线。成功返回文本, 失败返回 None(交由调用方回退 scnet)。绝不 sys.exit。"""
+    """主路线(流式)。成功返回文本, 失败返回 None(交由调用方回退 scnet)。绝不 sys.exit。"""
     sys_parts = [m["content"] for m in messages if m.get("role") == "system"]
     rest = [m for m in messages if m.get("role") != "system"]
     if not rest:
@@ -173,20 +209,23 @@ def _call_aixw(messages, cp, temperature, max_tokens):
         "temperature": temperature,
         "max_tokens": max_tokens,
         "top_p": 0.95,
+        "stream": True,                     # 流式: 规避官方对非流式调用的限流
     }
     if sys_parts:
         body["instructions"] = "\n".join(sys_parts)
     payload = json.dumps(body).encode('utf-8')
     headers = {
         "Content-Type": "application/json",
-        "Accept": "application/json",
+        "Accept": "text/event-stream",
         "Authorization": f"Bearer {AIXW_API_KEY}",
         "User-Agent": "OpenAI/Python 3.5.0",   # aixw 网关按此 UA 放行上游, 缺则 forbidden
     }
     url = f"{AIXW_BASE_URL}/responses"
     for attempt in range(AIXW_MAX_RETRIES):
         try:
-            raw = _post(url, headers, payload, timeout=120)
+            req = Request(url, data=payload, headers=headers, method='POST')
+            with urlopen(req, timeout=180) as resp:
+                text, usage = _read_aixw_stream(resp)
         except HTTPError as e:
             b = e.read().decode('utf-8', 'replace') if e.fp else ""
             if e.code == 429:
@@ -201,16 +240,11 @@ def _call_aixw(messages, cp, temperature, max_tokens):
         except Exception as e:
             logger.warning(f"  ⚠️ aixw 异常: {e}, 重试")
             time.sleep(3); continue
-        try:
-            result = json.loads(raw)
-        except json.JSONDecodeError:
-            logger.warning(f"  ⚠️ aixw 非JSON响应, 重试")
-            time.sleep(3); continue
-        text = _parse_aixw_output(result)
         if not text or not text.strip():
             logger.warning(f"  ⚠️ aixw 空响应, 重试 ({attempt+1}/{AIXW_MAX_RETRIES})")
             time.sleep(2); continue
-        _acct(cp, result.get("usage"))
+        if usage:
+            _acct(cp, usage)
         return text
     return None
 
