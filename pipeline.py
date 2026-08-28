@@ -82,6 +82,8 @@ CHECKPOINT_FILE = ""
 # ============================================================
 if not CHECKPOINT_FILE:
     CHECKPOINT_FILE = os.path.join(OUTPUT_ROOT, "checkpoint.json")
+# 实时监控运行时状态(供 monitor.ps1 读取, 与 checkpoint 同步写入)
+RUN_STATUS_FILE = os.path.join(OUTPUT_ROOT, "run_status.json")
 
 for sub in ["markdown", "cleaned", "qa_raw", "final", "logs"]:
     os.makedirs(os.path.join(OUTPUT_ROOT, sub), exist_ok=True)
@@ -100,15 +102,73 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # 【断点续传】
 # ============================================================
-def load_checkpoint() -> Dict:
-    if os.path.exists(CHECKPOINT_FILE):
-        with open(CHECKPOINT_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
+def _default_checkpoint() -> Dict:
+    """监控/续传所需全部字段的默认值(含新增的运行时状态字段)。"""
     return {
         "mineru_done": [], "clean_done": [], "qa_done": [],
         "total_input_tokens": 0, "total_output_tokens": 0,
-        "total_cache_tokens": 0, "last_update": ""
+        "total_cache_tokens": 0, "last_update": "",
+        # —— 实时监控运行时状态(供 monitor.ps1 读取) ——
+        "aixw_input_tokens": 0, "aixw_output_tokens": 0,
+        "scnet_input_tokens": 0, "scnet_output_tokens": 0,
+        "aixw_fallback_count": 0,          # 主路失败转入备路的次数
+        "current_model": "",               # 最近一次成功响应所用模型: "aixw" / "scnet"
+        "phase": "",                       # 当前阶段: 阶段1~4 / 完成 / 异常终止
+        "total_tasks": 0, "done_tasks": 0, # 当前阶段任务总量/已完成(用于剩余量)
+        "books_total": 0, "books_done": 0,
     }
+
+def load_checkpoint() -> Dict:
+    cp = _default_checkpoint()
+    if os.path.exists(CHECKPOINT_FILE):
+        try:
+            with open(CHECKPOINT_FILE, 'r', encoding='utf-8') as f:
+                cp.update(json.load(f))
+        except Exception:
+            pass
+    # 向后兼容: 旧 checkpoint 缺字段时补默认值(避免 _acct 等 KeyError)
+    for k, v in _default_checkpoint().items():
+        cp.setdefault(k, v)
+    return cp
+
+def _write_run_status(cp: Dict):
+    """把监控所需的关键运行时状态写到 run_status.json, 供 monitor.ps1 实时读取。
+    注意: 本函数不取 _CP_LOCK(只读快照写文件), 以免与调用方持有的锁重入死锁。"""
+    try:
+        status = {
+            "phase": cp.get("phase", ""),
+            "books_total": cp.get("books_total", 0),
+            "books_done": cp.get("books_done", 0),
+            "total_tasks": cp.get("total_tasks", 0),
+            "done_tasks": cp.get("done_tasks", 0),
+            "current_model": cp.get("current_model", ""),
+            "aixw_fallback_count": cp.get("aixw_fallback_count", 0),
+            "total_input_tokens": cp.get("total_input_tokens", 0),
+            "total_output_tokens": cp.get("total_output_tokens", 0),
+            "total_cache_tokens": cp.get("total_cache_tokens", 0),
+            "aixw_input_tokens": cp.get("aixw_input_tokens", 0),
+            "aixw_output_tokens": cp.get("aixw_output_tokens", 0),
+            "scnet_input_tokens": cp.get("scnet_input_tokens", 0),
+            "scnet_output_tokens": cp.get("scnet_output_tokens", 0),
+            "last_update": cp.get("last_update", ""),
+            "aixw_model": AIXW_MODEL,
+            "scnet_model": SCNET_MODEL,
+            "workers": WORKERS,
+            "fallback_enabled": FALLBACK_ENABLED,
+        }
+        final_path = os.path.join(OUTPUT_ROOT, "final", "rehab_lora_train_data.json")
+        if os.path.exists(final_path):
+            try:
+                with open(final_path, 'r', encoding='utf-8') as _f:
+                    status["sample_count"] = len(json.load(_f))
+            except Exception:
+                status["sample_count"] = 0
+        else:
+            status["sample_count"] = 0
+        with open(RUN_STATUS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(status, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 def save_checkpoint(cp: Dict):
     cp["last_update"] = datetime.now().isoformat()
@@ -116,6 +176,7 @@ def save_checkpoint(cp: Dict):
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(cp, f, ensure_ascii=False, indent=2)
     os.replace(tmp, CHECKPOINT_FILE)
+    _write_run_status(cp)   # 同步刷新监控状态
 
 def estimate_cost(cp: Dict) -> float:
     return round(
@@ -130,8 +191,9 @@ _CP_LOCK = threading.Lock()        # 保护 cp 的 token 统计与 checkpoint �
 _AIXW_STATE = {"fail_streak": 0, "disabled": False}
 _AIXW_LOCK = threading.Lock()
 
-def _acct(cp, usage):
-    """累加 token 用量(线程安全)。兼容 chat/completions 与 responses 两种 usage 字段名。"""
+def _acct(cp, usage, model="scnet"):
+    """累加 token 用量(线程安全)。兼容 chat/completions 与 responses 两种 usage 字段名。
+    model: "aixw" / "scnet", 用于把用量按模型分列(供监控窗口查看往来Token量)。"""
     if not usage:
         return
     with _CP_LOCK:
@@ -142,6 +204,12 @@ def _acct(cp, usage):
         details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
         cache_hit = usage.get("prompt_cache_hit_tokens", 0) or details.get("cached_tokens", 0)
         cp["total_cache_tokens"] += cache_hit
+        if model == "aixw":
+            cp["aixw_input_tokens"] += inp
+            cp["aixw_output_tokens"] += out
+        else:
+            cp["scnet_input_tokens"] += inp
+            cp["scnet_output_tokens"] += out
 
 def _post(url, headers, payload, timeout):
     req = Request(url, data=payload, headers=headers, method='POST')
@@ -244,7 +312,7 @@ def _call_aixw(messages, cp, temperature, max_tokens):
             logger.warning(f"  ⚠️ aixw 空响应, 重试 ({attempt+1}/{AIXW_MAX_RETRIES})")
             time.sleep(2); continue
         if usage:
-            _acct(cp, usage)
+            _acct(cp, usage, "aixw")
         return text
     return None
 
@@ -291,7 +359,7 @@ def _call_scnet(messages, cp, temperature, max_tokens):
         if not content or not content.strip():
             logger.warning(f"  ⚠️ scnet 空响应, 重试")
             time.sleep(2); continue
-        _acct(cp, result.get("usage"))
+        _acct(cp, result.get("usage"), "scnet")
         return content
     return None
 
@@ -305,13 +373,20 @@ def call_llm(messages: List[Dict], cp: Dict, temperature: float = 0.3,
         if content is not None:
             with _AIXW_LOCK:
                 _AIXW_STATE["fail_streak"] = 0
+            with _CP_LOCK:
+                cp["current_model"] = "aixw"
             return content
         with _AIXW_LOCK:
             _AIXW_STATE["fail_streak"] += 1
             if _AIXW_STATE["fail_streak"] >= 5:
                 _AIXW_STATE["disabled"] = True
                 logger.warning("  ⚡ aixw 连续失败5次 → 本批次剩余请求直接走 scnet(熔断)")
+        # 主路失败 -> 计一次回退(供监控窗口显示主备切换)
+        with _CP_LOCK:
+            cp["aixw_fallback_count"] = cp.get("aixw_fallback_count", 0) + 1
     content = _call_scnet(messages, cp, temperature, max_tokens)
+    with _CP_LOCK:
+        cp["current_model"] = "scnet" if content is not None else cp.get("current_model", "")
     return content
 
 # ============================================================
@@ -366,11 +441,13 @@ def detect_lang(filename: str) -> Optional[str]:
 def phase1_mineru(cp: Dict):
     sep = "=" * 60
     logger.info(f"\n{sep}\n【阶段1】MinerU 批量PDF->Markdown\n{sep}")
+    cp["phase"] = "阶段1·MinerU"
     pdf_dir = Path(PDF_INPUT_DIR)
     if not pdf_dir.exists():
         logger.error(f"PDF目录不存在: {PDF_INPUT_DIR}")
         sys.exit(1)
     pdfs = sorted(pdf_dir.glob("*.pdf"))
+    cp["books_total"] = len(pdfs)
     logger.info(f"  找到 {len(pdfs)} 本PDF")
     mineru_cmd = get_mineru_cmd()
     logger.info(f"  MinerU命令: {mineru_cmd}")
@@ -405,6 +482,7 @@ def phase1_mineru(cp: Dict):
             logger.error(f"           ❌ 异常: {e}")
         time.sleep(2)
     logger.info(f"  阶段1完成: {len(cp['mineru_done'])}/{len(pdfs)} 本")
+    save_checkpoint(cp)   # 刷新监控状态(书本总量/阶段)
 
 # ============================================================
 # 【阶段2】文本清洗
@@ -454,6 +532,9 @@ def phase2_clean(cp: Dict):
             if CLEAN_MAX_BLOCKS and len(cleaned_map) + len(tasks) >= CLEAN_MAX_BLOCKS:
                 break
             tasks.append((j, chunk))
+        cp["phase"] = "阶段2·文本清洗"
+        cp["total_tasks"] = len(tasks)
+        cp["done_tasks"] = 0
         logger.info(f"  🔧 并发清洗: 已完成{len(cleaned_map)}块, 待处理{len(tasks)}块, workers={WORKERS}")
 
         def _clean_worker(job):
@@ -482,6 +563,7 @@ def phase2_clean(cp: Dict):
                     done += 1
                     if done % 20 == 0 or done == len(tasks):
                         with _CP_LOCK:
+                            cp["done_tasks"] = done
                             save_checkpoint(cp)
                         logger.info(f"    🔧 清洗 {done}/{len(tasks)}")
         # 按顺序合并(已跳过 + 新洗)
@@ -565,6 +647,9 @@ def phase3_qa(cp: Dict):
             if QA_MAX_PER_BOOK and len(reused) >= QA_MAX_PER_BOOK:
                 break
             tasks.append((j, cid, chunk))
+        cp["phase"] = "阶段3·生成Q&A"
+        cp["total_tasks"] = len(tasks)
+        cp["done_tasks"] = 0
         logger.info(f"  🔧 并发QA: 复用{len(reused)}条, 待处理{len(tasks)}块, workers={WORKERS}")
 
         def _qa_worker(job):
@@ -606,6 +691,7 @@ def phase3_qa(cp: Dict):
                     done += 1
                     if done % 20 == 0 or done == len(tasks):
                         with _CP_LOCK:
+                            cp["done_tasks"] = done
                             save_checkpoint(cp)
                         logger.info(f"    🔧 QA {done}/{len(tasks)} (累计{len(reused)+len(new_items)}条)")
         all_qa = reused + new_items
@@ -617,6 +703,7 @@ def phase3_qa(cp: Dict):
         with _CP_LOCK:
             if book not in cp["qa_done"]:
                 cp["qa_done"].append(book)
+            cp["books_done"] = len(cp["qa_done"])
             save_checkpoint(cp)
         logger.info(f"  ✅ {book}: {len(all_qa)}条Q&A")
     logger.info(f"  阶段3完成 | 累计费用: ¥{estimate_cost(cp)}")
@@ -626,6 +713,7 @@ def phase3_qa(cp: Dict):
 # ============================================================
 def phase4_export(cp: Dict):
     sep = "=" * 60
+    cp["phase"] = "阶段4·导出"
     logger.info(f"\n{sep}\n【阶段4】导出LLaMA-Factory格式\n{sep}")
     qa_dir = Path(OUTPUT_ROOT) / "qa_raw"
     final_dir = Path(OUTPUT_ROOT) / "final"
@@ -698,6 +786,8 @@ def main():
             logger.error(f"   {_line}")
         logger.error("=" * 60)
         logger.error("已保留断点(checkpoint.json), 修复后重跑可续传。")
+        cp["phase"] = "异常终止"
+        _write_run_status(cp)
         raise
     elapsed = (time.time() - t0) / 60
     cost = estimate_cost(cp)
@@ -714,6 +804,9 @@ def main():
     logger.info(f"  - 请人工抽检>=10%的Q&A确保医学准确性")
     logger.info(f"  - 康复指导涉及患者安全, 务必经专业医师审核")
     logger.info(f"  - 建议先用小批量数据试训验证效果")
+    cp["phase"] = "完成"
+    cp["done_tasks"] = cp.get("total_tasks", 0)
+    _write_run_status(cp)   # 落盘最终状态, 供监控窗口显示"已完成"
 
 if __name__ == "__main__":
     # 可选: 弹出 PowerShell 实时监控窗口 (python pipeline.py --monitor)
